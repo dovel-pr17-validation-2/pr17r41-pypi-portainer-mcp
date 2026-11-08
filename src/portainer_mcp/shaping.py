@@ -1,0 +1,212 @@
+"""Universal response shaping for every tool the server exposes.
+
+Two cooperating layers:
+
+1. `ResponseCapMiddleware` — caps every tool result's text content at
+   `max_chars`. The final safety valve.
+
+2. `SelectArgTransform` — wraps every tool with an optional JMESPath
+   `select` parameter, so the model can project noisy Portainer
+   responses server-side. Tools that already declare `select` are passed
+   through unchanged.
+
+`select` narrows first (cheaper bodies); the cap catches whatever slips
+through (model omitted `select`, or the post-projection body is still
+genuinely big).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Sequence
+from typing import Annotated, Any
+
+import jmespath
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.server.transforms import Transform, VersionSpec
+from fastmcp.tools import Tool, forward
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
+from pydantic import Field
+
+from portainer_mcp import redaction
+
+logger = logging.getLogger("portainer_mcp")
+
+# Must fire before Claude Code's MCP output cap (~25k tokens, ~62k chars
+# for dense Portainer JSON at ~2.5 chars/token) so our truncation hint —
+# which names `select` and shows an example — reaches the model instead
+# of Claude Code's generic "saved to file, use offset/limit/jq" message
+# (which steers the model toward jq against the spilled file rather than
+# retrying with a server-side projection). 50k chars leaves ~12k headroom
+# below that ceiling plus room for the hint itself. Override via
+# PORTAINER_MAX_RESPONSE_CHARS.
+DEFAULT_MAX_RESPONSE_CHARS = 50_000
+
+SELECT_DESCRIPTION = (
+    "Optional JMESPath expression to project the response server-side. "
+    "Use it on noisy endpoints to drop fields you don't need — e.g. "
+    "`[].{id:Id,name:Name,type:Type}` for a list of environments, or "
+    "`{kind:Kind,name:metadata.name,phase:status.phase}` for a single K8s object. "
+    "Omit to receive the full response (subject to the global size cap)."
+)
+
+
+def project(data: Any, select: str) -> Any:
+    """Apply a JMESPath expression to `data`, or raise `ValueError`."""
+    try:
+        return jmespath.search(select, data)
+    except jmespath.exceptions.JMESPathError as exc:
+        # Models nesting the expression inside a JSON tool call routinely
+        # double-escape quoted identifiers, so literal \" reaches the lexer
+        # and fails with an opaque "Unknown token \". Name the fix.
+        hint = ""
+        if '\\"' in select:
+            hint = (
+                " (the expression contains literal backslash-escaped quotes; "
+                "send plain double quotes around dotted keys, or avoid "
+                "quoting entirely with a function filter such as "
+                "[?contains(metadata.name, 'foo')])"
+            )
+        raise ValueError(
+            f"invalid JMESPath expression {select!r}: {exc}{hint}"
+        ) from exc
+
+
+class ResponseCapMiddleware(Middleware):
+    """Truncate oversized tool results with a hint to narrow `select`.
+
+    Applied uniformly to every tool except `exempt` ones. When truncation
+    fires, the `structured_content` field is also cleared so the model can't
+    read around the cap by inspecting the structured copy of the same payload.
+    """
+
+    def __init__(self, max_chars: int, exempt: frozenset[str] = frozenset()) -> None:
+        super().__init__()
+        self.max_chars = max_chars
+        self._exempt = exempt
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext,
+        call_next: CallNext,
+    ) -> ToolResult:
+        result = await call_next(context)
+        if context.message.name in self._exempt:
+            return result
+        truncated = False
+        for item in result.content:
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and len(text) > self.max_chars:
+                item.text = (
+                    text[: self.max_chars]
+                    + f"\n\n[truncated: response was {len(text)} chars, "
+                    + f"capped at {self.max_chars}. Retry with a JMESPath "
+                    + "`select` to project just the fields you need — e.g. "
+                    + '`select="[].{id:Id,name:Name}"` for a list response, '
+                    + 'or `select="{name:metadata.name,phase:status.phase}"` '
+                    + "for a single object.]"
+                )
+                truncated = True
+        if truncated:
+            result.structured_content = None
+        return result
+
+
+def _parse_for_shaping(result: ToolResult, select: str | None) -> Any:
+    """Return parsed JSON body of `result`, or `None` if there's nothing
+    to shape. Raises `ValueError` only when `select` was asked for but the
+    body isn't JSON — the redaction-only path passes through quietly.
+    """
+    data = result.structured_content
+    if data is not None:
+        return data
+    text_blocks = [
+        getattr(c, "text", None) for c in result.content if hasattr(c, "text")
+    ]
+    candidate = next((t for t in text_blocks if isinstance(t, str) and t), None)
+    if candidate is None:
+        return None
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        if select:
+            raise ValueError(
+                f"response was not JSON; cannot apply `select`: {exc}"
+            ) from exc
+        return None
+
+
+async def _select_wrapper(
+    select: Annotated[str | None, Field(description=SELECT_DESCRIPTION)] = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Call the parent tool, redact env values, then project via JMESPath."""
+    result = await forward(**kwargs)
+    expose = redaction.is_expose_enabled()
+    if expose and not select:
+        return result  # nothing to do; preserve the existing fast path
+
+    data = _parse_for_shaping(result, select)
+    if data is None:
+        return result
+
+    # FastMCP wraps non-dict OpenAPI responses as `{"result": ...}` so they
+    # fit MCP's structured_content schema (which must be an object). Unwrap
+    # before redacting / projecting so callers write against the natural API
+    # shape — e.g. `[].Id` against a list endpoint — rather than
+    # `result[].Id`, and so the env walker reaches list-of-objects bodies.
+    if isinstance(data, dict) and set(data.keys()) == {"result"}:
+        data = data["result"]
+
+    if not expose:
+        data, _ = redaction.redact_envs(data)
+    if select:
+        data = project(data, select)
+
+    body = json.dumps(data)
+    # Count what survived into the projected body, not what was redacted
+    # upstream — otherwise a projection that drops every env field still
+    # reports a non-zero count for values the caller never sees.
+    redaction_count = 0 if expose else redaction.count_in(body)
+    content = [TextContent(type="text", text=body)]
+    if redaction_count:
+        content.append(
+            TextContent(type="text", text=redaction.hint(redaction_count))
+        )
+    return ToolResult(
+        content=content,
+        # MCP structured_content must be a dict; drop it for lists/scalars.
+        structured_content=data if isinstance(data, dict) else None,
+    )
+
+
+def _has_select(tool: Tool) -> bool:
+    props = (tool.parameters or {}).get("properties") or {}
+    return "select" in props
+
+
+class SelectArgTransform(Transform):
+    """Wrap every tool with an optional JMESPath `select` argument.
+
+    Tools that already declare `select` are passed through unchanged.
+    """
+
+    async def list_tools(self, tools: Sequence[Tool]) -> Sequence[Tool]:
+        return [
+            t if _has_select(t) else Tool.from_tool(t, transform_fn=_select_wrapper)
+            for t in tools
+        ]
+
+    async def get_tool(
+        self,
+        name: str,
+        call_next: Any,
+        *,
+        version: VersionSpec | None = None,
+    ) -> Tool | None:
+        tool = await call_next(name, version=version)
+        if tool is None or _has_select(tool):
+            return tool
+        return Tool.from_tool(tool, transform_fn=_select_wrapper)

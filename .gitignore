@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.egg-info/
+spec/upstream/
+logs/
+*.local.md
+docs/local
+.env
+dist/
+.DS_Store
